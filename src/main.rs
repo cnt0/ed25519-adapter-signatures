@@ -1,7 +1,7 @@
 use curve25519_dalek::{
     constants::ED25519_BASEPOINT_TABLE as G, edwards::EdwardsPoint, scalar::Scalar,
 };
-use ed25519_dalek::{PublicKey, Verifier};
+use ed25519_dalek::{PublicKey, SecretKey, Verifier};
 use rand::rngs::OsRng;
 use sha2::{Digest, Sha512};
 
@@ -10,19 +10,14 @@ struct ExpandedSecretKey {
     nonce: [u8; 32],
 }
 
-impl ExpandedSecretKey {
-    fn generate<R>(csprng: &mut R) -> Self
-    where
-        R: rand::CryptoRng + rand::RngCore,
-    {
-        let mut rand_data = [0u8; 32];
-        csprng.fill_bytes(&mut rand_data);
+impl From<SecretKey> for ExpandedSecretKey {
+    fn from(sk: SecretKey) -> Self {
         let mut h = Sha512::new();
         let mut hash: [u8; 64] = [0u8; 64];
         let mut lower: [u8; 32] = [0u8; 32];
         let mut upper: [u8; 32] = [0u8; 32];
 
-        h.update(&rand_data);
+        h.update(sk.as_bytes());
         hash.copy_from_slice(h.finalize().as_slice());
 
         lower.copy_from_slice(&hash[00..32]);
@@ -36,6 +31,15 @@ impl ExpandedSecretKey {
             key: Scalar::from_bits(lower),
             nonce: upper,
         }
+    }
+}
+
+impl ExpandedSecretKey {
+    fn generate<R>(csprng: &mut R) -> Self
+    where
+        R: rand::CryptoRng + rand::RngCore,
+    {
+        SecretKey::generate(csprng).into()
     }
     fn validate(R: &EdwardsPoint) -> bool {
         !R.is_small_order()
