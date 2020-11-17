@@ -1,18 +1,9 @@
 use curve25519_dalek::{
     constants::ED25519_BASEPOINT_TABLE as G, edwards::EdwardsPoint, scalar::Scalar,
 };
-use ed25519_dalek::{Keypair, PublicKey, SecretKey};
+use ed25519_dalek::{PublicKey, Verifier};
 use rand::rngs::OsRng;
 use sha2::{Digest, Sha512};
-
-fn keypair_from_scalar(scalar: &Scalar) -> Result<Keypair, Box<dyn std::error::Error>> {
-    let sk = SecretKey::from_bytes(scalar.as_bytes())?;
-    let pk: PublicKey = (&sk).into();
-    Ok(Keypair {
-        secret: sk,
-        public: pk,
-    })
-}
 
 struct ExpandedSecretKey {
     key: Scalar,
@@ -51,44 +42,13 @@ impl ExpandedSecretKey {
     }
     fn challenge(ephemeral_pk: &EdwardsPoint, pk: &EdwardsPoint, message: &[u8]) -> Scalar {
         let mut hasher = Sha512::new();
-        hasher.update(ephemeral_pk.compress().as_bytes());
         hasher.update(pk.compress().as_bytes());
+        hasher.update(ephemeral_pk.compress().as_bytes());
         hasher.update(&message);
         Scalar::from_hash(hasher)
     }
     fn public_key(&self) -> EdwardsPoint {
         &self.key * &G
-    }
-    fn sign(&self, message: &[u8]) -> Signature {
-        let mut hasher = Sha512::new();
-        hasher.update(self.nonce);
-        hasher.update(&message);
-        let r = Scalar::from_hash(hasher);
-        let R = &r * &G;
-
-        hasher = Sha512::new();
-        hasher.update(R.compress().as_bytes());
-        hasher.update(self.public_key().compress().as_bytes()); // A
-        hasher.update(&message); // M
-        let challenge = &Scalar::from_hash(hasher);
-        let s = &(challenge * self.key) + &r; // H(R, A, M) * s + r
-
-        Signature { R, s }
-    }
-}
-
-struct Signature {
-    R: EdwardsPoint,
-    s: Scalar,
-}
-
-impl Signature {
-    fn verify(&self, pk: &EdwardsPoint, message: &[u8]) -> bool {
-        let mut hasher = Sha512::new();
-        hasher.update(self.R.compress().as_bytes());
-        hasher.update(pk.compress().as_bytes());
-        hasher.update(&message);
-        &self.s * &G - &Scalar::from_hash(hasher) * pk == self.R
     }
 }
 
@@ -100,7 +60,7 @@ fn test_adapter() {
     let r = ExpandedSecretKey::generate(&mut csprng);
     let t = ExpandedSecretKey::generate(&mut csprng);
     let (R, T) = (r.public_key(), t.public_key());
-    assert!(ExpandedSecretKey::validate(&(&(&r.key + &t.key) * &G)));
+    assert!(ExpandedSecretKey::validate(&(&(r.key + t.key) * &G)));
 
     // Bob generates challenge and sends c*b to Alice
     let b = ExpandedSecretKey::generate(&mut csprng);
@@ -127,8 +87,8 @@ fn test_full_protocol() {
     let mut csprng = OsRng;
 
     // messages to be signed
-    let msg_alice = "hello bob";
-    let msg_bob = "hello alice";
+    let msg_alice = "hello Bob";
+    let msg_bob = "hello Alice";
 
     // Alice and Bob generate 2 ephemeral verification keys each
     // Alice knows a1, a2
@@ -185,12 +145,109 @@ fn test_full_protocol() {
     // sigma2 is correct as well
     assert_eq!(&sigma2 * &G, &c2 * (A2 + B2) + R2 + T);
 
-    //TODO: use verification functions from ed25519_dalek
+    println!("original protocol: OK");
+}
 
-    println!("ok OK");
+fn test_modified_protocol() {
+    let mut csprng = OsRng;
+
+    // messages to be signed
+    let msg_alice = "send 10 BTC from Bob to Alice";
+    let msg_bob = "send 20 Ether from Alice to Bob";
+
+    // Alice and Bob generate 2 ephemeral verification keys each
+    // Alice knows a1, a2
+    let (a1, a2) = (
+        ExpandedSecretKey::generate(&mut csprng),
+        ExpandedSecretKey::generate(&mut csprng),
+    );
+    // Bob knows b1, b2
+    let (b1, b2) = (
+        ExpandedSecretKey::generate(&mut csprng),
+        ExpandedSecretKey::generate(&mut csprng),
+    );
+
+    // msg_alice will be signed with (a1 + b1)
+    // msg_bob will be signed with (a2 + b2)
+    let (A1, A2) = (a1.public_key(), a2.public_key());
+    let (B1, B2) = (b1.public_key(), b2.public_key());
+
+    // Alice chooses t, ra and sends T, Ra to Bob
+    let (t, ra) = (
+        ExpandedSecretKey::generate(&mut csprng),
+        ExpandedSecretKey::generate(&mut csprng),
+    );
+    let (T, Ra) = (t.public_key(), ra.public_key());
+
+    // Bob chooses rb and sends Rb to Alice
+    let rb = ExpandedSecretKey::generate(&mut csprng);
+    let Rb = rb.public_key();
+
+    // Alice also generates challenges and sends (c1 * a1), (c2 * a2) to Bob
+    let c1 = ExpandedSecretKey::challenge(&(A1 + B1), &(Rb + T), msg_alice.as_bytes());
+    let c2 = ExpandedSecretKey::challenge(&(A2 + B2), &(Ra + T), msg_bob.as_bytes());
+    let c1a1 = c1 * a1.key;
+    let c2a2 = c2 * a2.key;
+
+    // Bob adds his part to generate c1*(a1 + b1), c2*(a2 + b2)
+    // He can compute c1, c2 on his own
+    let c1a1b1 = c1a1 + c1 * b1.key;
+    // Bob sends c2*(a2 + b2) to Alice but keeps c1*(a1 + b1) for now
+    let c2a2b2 = c2a2 + c2 * b2.key;
+
+    // Alice uses it to generate adaptor signature for msg_bob and sends it to Bob
+    let sigma_adapt_bob = ra.key + c2a2b2;
+
+    // Bob verifies this signature
+    assert_eq!(&sigma_adapt_bob * &G, c2 * (A2 + B2) + Ra);
+
+    // at this stage, Bob doesn't know t. However, successful verification means that,
+    // when Alice will publish her full signature, Bob will be able to infer that value,
+    // and, in turn, publish his signature
+
+    // verification is OK so Bob is safe to share his adaptor with Alice
+    let sigma_adapt_alice = rb.key + c1a1b1;
+
+    // Alice is now able to publish her full signature
+    let sigma_alice: Scalar = sigma_adapt_alice + t.key;
+    assert_eq!(&sigma_alice * &G, &c1 * (A1 + B1) + Rb + T);
+
+    // let's make sure that this is correct ed25519 signature
+    // by independently verifying it with ed25519_dalek library
+    let verify = |e_pk: &EdwardsPoint, pk: &EdwardsPoint, msg, sigma: &Scalar| {
+        let mut sa_bytes = [0u8; 64];
+        sa_bytes[..32].copy_from_slice((e_pk).compress().as_bytes());
+        sa_bytes[32..].copy_from_slice(sigma.as_bytes());
+        let dalek_pk = PublicKey::from_bytes(pk.compress().as_bytes())
+            .ok()
+            .unwrap();
+        dalek_pk.verify(msg, &sa_bytes.into()).is_ok()
+    };
+    assert!(verify(
+        &(Rb + T),
+        &(A1 + B1),
+        msg_alice.as_bytes(),
+        &sigma_alice
+    ));
+
+    // Bob can now infer `t` and build his signature
+    let t_bob = sigma_alice - sigma_adapt_alice;
+    let sigma_bob = sigma_adapt_bob + t_bob;
+    assert_eq!(&sigma_bob * &G, &c2 * (A2 + B2) + Ra + T);
+
+    // this is correct ed25519 signature as well
+    assert!(verify(
+        &(Ra + T),
+        &(A2 + B2),
+        msg_bob.as_bytes(),
+        &sigma_bob
+    ));
+
+    println!("modified protocol: OK");
 }
 
 fn main() {
     test_adapter();
     test_full_protocol();
+    test_modified_protocol();
 }
